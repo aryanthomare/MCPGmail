@@ -199,7 +199,7 @@ async def run_mcp_agent(
             }
         }
     ) as mcp_client:
-        tools = mcp_client.get_tools()
+        tools = await mcp_client.get_tools()
 
         if debug_logger:
             debug_logger.log("mcp_tools", [t.name for t in tools])

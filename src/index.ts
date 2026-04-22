@@ -28,7 +28,7 @@ async function main() {
     gmail: {
       transport: 'stdio',
       command: MCP_COMMAND,
-      args: ['-y', ...MCP_ARGS.filter((a) => a !== '-y')],
+      args: MCP_ARGS,
     },
   });
 
@@ -56,11 +56,18 @@ async function main() {
 
     for (const message of response.messages) {
       const type = message._getType();
+      if (type !== 'ai') {
+        continue;
+      }
       const content =
         typeof message.content === 'string'
           ? message.content
           : JSON.stringify(message.content);
-      if (type === 'ai' && content && !('tool_calls' in message && (message as { tool_calls?: unknown[] }).tool_calls?.length)) {
+      const hasToolCalls =
+        'tool_calls' in message &&
+        Array.isArray((message as { tool_calls?: unknown[] }).tool_calls) &&
+        ((message as { tool_calls?: unknown[] }).tool_calls?.length ?? 0) > 0;
+      if (content && !hasToolCalls) {
         console.log(content);
       }
     }

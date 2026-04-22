@@ -363,7 +363,7 @@ async def fetch_tools(
             }
         }
     ) as client:
-        return list(client.get_tools())
+        return list(await client.get_tools())
 
 
 async def main() -> None:
