@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import json
 import os
 import re
@@ -88,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=512,
+        default=800,
         help="Maximum tokens in the response.",
     )
     parser.add_argument(
@@ -196,12 +197,59 @@ def build_prompt_from_mcp_request(
 
 def extract_json_object(text: str) -> dict[str, object] | None:
     start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
+    if start == -1:
         return None
 
+    depth = 0
+    in_string = False
+    escape = False
+
+    for index in range(start, len(text)):
+        char = text[index]
+
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == '{':
+            depth += 1
+        elif char == '}':
+            depth -= 1
+            if depth == 0:
+                candidate = text[start : index + 1]
+                payload = try_parse_json_object(candidate)
+                if payload is not None:
+                    return payload
+
+                repaired = repair_missing_closers(candidate)
+                if repaired is not None:
+                    payload = try_parse_json_object(repaired)
+                    if payload is not None:
+                        return payload
+
+                return None
+
+    if depth > 0:
+        candidate = text[start:]
+        repaired = repair_missing_closers(candidate)
+        if repaired is not None:
+            payload = try_parse_json_object(repaired)
+            if payload is not None:
+                return payload
+
+    return None
+
+
+def try_parse_json_object(text: str) -> dict[str, object] | None:
     try:
-        payload = json.loads(text[start : end + 1])
+        payload = json.loads(text)
     except json.JSONDecodeError:
         return None
 
@@ -211,7 +259,50 @@ def extract_json_object(text: str) -> dict[str, object] | None:
     return None
 
 
+def repair_missing_closers(text: str) -> str | None:
+    open_braces = 0
+    open_brackets = 0
+    in_string = False
+    escape = False
+
+    for char in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == '{':
+            open_braces += 1
+        elif char == '}':
+            open_braces -= 1
+        elif char == '[':
+            open_brackets += 1
+        elif char == ']':
+            open_brackets -= 1
+
+    if open_braces < 0 or open_brackets < 0:
+        return None
+
+    if not open_braces and not open_brackets:
+        return None
+
+    if open_brackets > 0 and text.endswith("}"):
+        return f"{text[:-1]}{']' * open_brackets}}}"
+
+    closing = "]" * open_brackets + "}" * open_braces
+    return f"{text}{closing}"
+
+
 def build_step_prompt(request_text: str, tool_prompt: str, tool_outputs: str | None = None) -> str:
+    if tool_outputs:
+        tool_outputs = truncate_for_prompt(tool_outputs)
+
     sections = [
         "User request:",
         request_text,
@@ -229,6 +320,15 @@ def build_step_prompt(request_text: str, tool_prompt: str, tool_outputs: str | N
         )
 
     return "\n".join(sections)
+
+
+def truncate_for_prompt(text: str, max_chars: int = 6000) -> str:
+    if len(text) <= max_chars:
+        return text
+
+    head = text[: max_chars // 2]
+    tail = text[-(max_chars // 2) :]
+    return f"{head}\n\n[...truncated for planning context...]\n\n{tail}"
 
 
 def find_oauth_keys_file() -> Path | None:
@@ -286,10 +386,30 @@ def tool_result_to_payload(result: object) -> object:
 
 
 def clean_email_body(text: str) -> str:
-    # Remove URLs first to avoid leaving fragmented protocol symbols.
-    no_links = re.sub(r"https?://\S+|www\.\S+", " ", text)
+    # Decode entities and remove links first.
+    normalized = html.unescape(text)
+    normalized = re.sub(r"https?://\S+|www\.\S+", " ", normalized)
+
+    # Drop full script/style blocks, comments, and any HTML tags.
+    normalized = re.sub(r"(?is)<(script|style)\b.*?>.*?</\1>", " ", normalized)
+    normalized = re.sub(r"(?is)<!--.*?-->", " ", normalized)
+    normalized = re.sub(r"(?is)<[^>]+>", " ", normalized)
+
+    # Remove common template artifacts that may remain after tag stripping.
+    normalized = re.sub(r"(?i)\b(?:if|endif|mso|gte|acrite-mso-css)\b", " ", normalized)
+    normalized = re.sub(
+        r"(?i)\b(?:class|id|href|src|style|align|cellpadding|cellspacing|border|width|height|data-[a-z0-9_-]+)\s*=?\s*(?:\"[^\"]*\"|'[^']*')",
+        " ",
+        normalized,
+    )
+    normalized = re.sub(
+        r"(?i)\b/?(?:div|span|table|tbody|thead|tr|td|th|html|body|head|meta|link|script|style)\b",
+        " ",
+        normalized,
+    )
+
     # Keep letters, numbers, whitespace, and a small safe punctuation set.
-    no_special = re.sub(r"[^A-Za-z0-9\s.,:;!?@\-_'\"()\[\]/]", " ", no_links)
+    no_special = re.sub(r"[^A-Za-z0-9\s.,:;!?@\-_'\"()\[\]/]", " ", normalized)
     # Normalize whitespace for easier downstream summarization.
     compact = re.sub(r"\s+", " ", no_special).strip()
     return compact
@@ -303,6 +423,10 @@ def build_planning_system_prompt() -> str:
         "Never include a tool whose arguments depend on a result that has not been produced yet. "
         "If the next needed action depends on a search result ID, choose search_emails first. "
         "If no tool is needed, return an empty chosenTools array. "
+        "If you already have enough email data to write a useful summary, return an empty chosenTools array even if more emails may exist. "
+        "For summary requests, stop planning once you have enough representative emails to describe the inbox clearly. "
+        "Prefer stopping early over collecting extra emails. "
+        "Do not request another round just to gather more detail unless the current data is clearly insufficient. "
         "Do not invent IDs. Do not ask clarifying questions."
     )
 
@@ -313,7 +437,10 @@ def build_final_answer_prompt(user_request: str, tool_outputs: str) -> str:
         f"{user_request}\n\n"
         "Executed tool outputs:\n"
         f"{tool_outputs}\n\n"
-        "Write a direct, helpful final answer for the user using the tool outputs above."
+        "Write a concise final answer for the user using the tool outputs above. "
+        "Keep it under 250 words. Use at most 5 bullet points. "
+        "Start with a one-sentence overall summary, then list the most important emails. "
+        "Do not repeat the full email bodies or add filler text."
     )
 
 
@@ -322,6 +449,27 @@ def extract_message_id(text: str) -> str | None:
     if match:
         return match.group(1)
     return None
+
+
+def extract_message_ids(text: str) -> list[str]:
+    return re.findall(r"\bID:\s*([A-Za-z0-9_-]+)", text)
+
+
+def summarize_tool_output_for_planning(name: str, cleaned_text: str, raw_text: str) -> str:
+    if name == "search_emails":
+        message_ids = extract_message_ids(raw_text)
+        if not message_ids:
+            return "Search completed. No message IDs found in result."
+
+        preview_ids = ", ".join(message_ids[:10])
+        suffix = "" if len(message_ids) <= 10 else f" (+{len(message_ids) - 10} more)"
+        return (
+            f"Search completed. Found {len(message_ids)} message IDs. "
+            f"IDs: {preview_ids}{suffix}. "
+            f"Use one of these IDs for read_email."
+        )
+
+    return truncate_for_prompt(cleaned_text, max_chars=2000)
 
 
 def resolve_dynamic_arguments(arguments: dict[str, object], last_message_id: str | None) -> dict[str, object]:
@@ -421,6 +569,11 @@ async def execute_mcp_tools_from_plan(
                     result = await session.call_tool(name, arguments)
                     result_text = tool_result_to_text(result)
                     cleaned_result_text = clean_email_body(result_text)
+                    planning_result_text = summarize_tool_output_for_planning(
+                        name,
+                        cleaned_result_text,
+                        result_text,
+                    )
                     result_payload = tool_result_to_payload(result)
                     if debug_logger:
                         debug_logger.log(
@@ -431,18 +584,14 @@ async def execute_mcp_tools_from_plan(
                                 "payload": result_payload,
                                 "text": result_text,
                                 "cleaned_text": cleaned_result_text,
+                                "planning_text": planning_result_text,
                             },
                         )
-                    outputs.append(
-                        f"MCP return for {name}\n"
-                        f"Arguments: {json.dumps(arguments)}\n"
-                        f"Raw payload: {json.dumps(result_payload, default=str)}"
-                    )
                     maybe_message_id = extract_message_id(result_text)
                     if maybe_message_id:
                         last_message_id = maybe_message_id
                     outputs.append(
-                        f"Tool: {name}\nArguments: {json.dumps(arguments)}\nResult:\n{cleaned_result_text}"
+                        f"Tool: {name}\nArguments: {json.dumps(arguments)}\nResult:\n{planning_result_text}"
                     )
                 except Exception as error:  # noqa: BLE001
                     if debug_logger:
@@ -482,7 +631,64 @@ def request_planned_step(
     return response.choices[0].message.content if response.choices else None
 
 
-def extract_chosen_tools(plan_content: str | None) -> dict[str, object] | None:
+def request_planned_step_with_retry(
+    client: OpenAI,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float,
+    max_tokens: int,
+    debug_logger: DebugLogger | None = None,
+    retry_count: int = 2,
+) -> str | None:
+    current_user_prompt = user_prompt
+
+    for attempt in range(retry_count):
+        try:
+            plan_content = request_planned_step(
+                client=client,
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=current_user_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception as error:  # noqa: BLE001
+            if debug_logger:
+                debug_logger.log(
+                    "planning_attempt_error",
+                    {
+                        "attempt": attempt + 1,
+                        "error": str(error),
+                    },
+                )
+            plan_content = None
+
+        if plan_content:
+            plan_json = extract_planning_plan(plan_content)
+            if plan_json is not None:
+                return plan_content
+
+        if debug_logger:
+            debug_logger.log(
+                "planning_attempt_invalid",
+                {
+                    "attempt": attempt + 1,
+                    "content": plan_content,
+                },
+            )
+
+        current_user_prompt = (
+            f"{user_prompt}\n\n"
+            "Your previous response was invalid, incomplete, or missing JSON. "
+            "Return one complete JSON object only with the exact chosenTools shape. "
+            "Do not add markdown, prose, or extra fields."
+        )
+
+    return None
+
+
+def extract_planning_plan(plan_content: str | None) -> dict[str, object] | None:
     if not plan_content:
         return None
 
@@ -492,6 +698,14 @@ def extract_chosen_tools(plan_content: str | None) -> dict[str, object] | None:
 
     chosen_tools = plan_json.get("chosenTools")
     if not isinstance(chosen_tools, list):
+        return None
+
+    return plan_json
+
+
+def extract_chosen_tools(plan_content: str | None) -> dict[str, object] | None:
+    plan_json = extract_planning_plan(plan_content)
+    if plan_json is None:
         return None
 
     return plan_json
@@ -604,19 +818,20 @@ def main() -> None:
 
     tool_outputs: list[str] = []
     current_prompt = build_step_prompt(args.mcp_request, user_prompt)
-    max_rounds = 3
+    max_rounds = 10
 
     for round_index in range(max_rounds):
         try:
             section_title = f"planning_round_{round_index + 1}"
             log_section(debug_logger, section_title, "start", {"prompt": current_prompt})
-            plan_content = request_planned_step(
+            plan_content = request_planned_step_with_retry(
                 client=client,
                 model=args.model,
                 system_prompt=planning_system,
                 user_prompt=current_prompt,
                 temperature=args.temperature,
                 max_tokens=args.max_tokens,
+                debug_logger=debug_logger,
             )
             if debug_logger.enabled:
                 debug_logger.log(
@@ -686,6 +901,7 @@ def main() -> None:
             log_section(debug_logger, f"tool_execution_round_{round_index + 1}", "end")
 
         tool_outputs.append(round_output)
+
         current_prompt = build_step_prompt(
             args.mcp_request,
             user_prompt,
