@@ -1,2 +1,4 @@
-mcp
-openai
+langchain>=1.2.15
+langchain-ollama>=1.1.0
+langchain-mcp-adapters>=0.2.2
+langgraph>=1.1.9
