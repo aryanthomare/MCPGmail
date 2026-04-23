@@ -10,8 +10,11 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from mcp import ClientSession, StdioServerParameters, stdio_client
-from openai import OpenAI
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_ollama import ChatOllama
+from langchain_core.messages import HumanMessage, SystemMessage
+
+
 
 
 @dataclass(frozen=True)
@@ -100,6 +103,18 @@ def extract_json_object(text: str) -> dict[str, object] | None:
     return None
 
 
+def get_tool_schema(tool: object) -> dict[str, object]:
+    """Extract the input schema from a LangChain tool (args_schema) or fall back to {}."""
+    args_schema = getattr(tool, "args_schema", None)
+    if args_schema is None:
+        return {}
+    if hasattr(args_schema, "model_json_schema"):
+        return args_schema.model_json_schema()  # type: ignore[return-value]
+    if hasattr(args_schema, "schema"):
+        return args_schema.schema()  # type: ignore[return-value]
+    return {}
+
+
 def build_ranking_prompt(request: str, tools: list[object]) -> str:
     tool_catalog = [
         {
@@ -140,21 +155,14 @@ def rank_tools_with_local_model(
 
     base_url = os.getenv(
         "LOCAL_LLM_BASE_URL",
-        os.getenv("OLLAMA_OPENAI_BASE_URL", "http://localhost:11434/v1"),
+        os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
     )
     model = os.getenv(
         "LOCAL_LLM_MODEL",
-        os.getenv("OLLAMA_OPENAI_MODEL", "gemma4"),
-    )
-    api_key = os.getenv(
-        "LOCAL_LLM_API_KEY",
-        os.getenv("OLLAMA_OPENAI_API_KEY", "ollama"),
+        os.getenv("OLLAMA_MODEL", "gemma4"),
     )
 
-    client = OpenAI(
-        base_url=base_url,
-        api_key=api_key,
-    )
+    llm = ChatOllama(model=model, base_url=base_url, temperature=0.0, format="json")
     prompt = build_ranking_prompt(request, tools)
     if debug_logger:
         debug_logger.log(
@@ -177,36 +185,20 @@ def rank_tools_with_local_model(
         nonlocal last_error
         nonlocal last_content
         try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a tool-ranking assistant. Return valid JSON only with the requested shape."
-                        ),
-                    },
-                    {"role": "user", "content": prompt_text},
-                ],
-                temperature=0.0,
-                max_tokens=512,
-                response_format={"type": "json_object"},
-            )
+            messages = [
+                SystemMessage(content="You are a tool-ranking assistant. Return valid JSON only with the requested shape."),
+                HumanMessage(content=prompt_text),
+            ]
+            response = llm.invoke(messages)
         except Exception as error:  # noqa: BLE001
             last_error = str(error)
             if debug_logger:
                 debug_logger.log(f"{prefix}_error", str(error))
             return None
 
-        response_dump: object
-        if hasattr(response, "model_dump"):
-            response_dump = response.model_dump()
-        else:
-            response_dump = str(response)
-        if debug_logger:
-            debug_logger.log(f"{prefix}_response_raw", response_dump)
-
-        content = response.choices[0].message.content if response.choices else None
+        content = response.content if hasattr(response, "content") else None
+        if isinstance(content, list):
+            content = " ".join(str(part) for part in content)
         last_content = content
         if debug_logger:
             debug_logger.log(f"{prefix}_response_content", content)
@@ -224,7 +216,7 @@ def rank_tools_with_local_model(
         return ranked_entries
 
     ranked_entries = request_ranking(prompt, "local_model")
-    
+
     # Parse and log skipped tools from the JSON response if available
     skipped_tools = []
     if last_content:
@@ -233,7 +225,7 @@ def rank_tools_with_local_model(
             skipped_tools = response_json.get("skipped", [])
             if debug_logger and skipped_tools:
                 debug_logger.log("model_skipped_tools", skipped_tools)
-    
+
     if not ranked_entries:
         if debug_logger:
             debug_logger.log(
@@ -265,7 +257,7 @@ def rank_tools_with_local_model(
 
         seen_names.add(name)
         description = getattr(tool, "description", "") or ""
-        input_schema = getattr(tool, "inputSchema", {}) or {}
+        input_schema = get_tool_schema(tool)
         reason = entry.get("reason")
         ranked_tools.append(
             RankedTool(
@@ -298,7 +290,7 @@ def rank_tools(tools: list[object], request: str) -> list[RankedTool]:
     for tool in tools:
         name = getattr(tool, "name", "") or ""
         description = getattr(tool, "description", "") or ""
-        input_schema = getattr(tool, "inputSchema", {}) or {}
+        input_schema = get_tool_schema(tool)
         haystack = tokenize(f"{name} {description} {json.dumps(input_schema, default=str)}")
 
         matches = sorted(request_tokens.intersection(haystack))
@@ -329,7 +321,7 @@ def build_prompt(request: str, tools: list[object]) -> str:
         {
             "name": getattr(tool, "name", "") or "",
             "description": getattr(tool, "description", "") or "",
-            "inputSchema": getattr(tool, "inputSchema", {}) or {},
+            "inputSchema": get_tool_schema(tool),
         }
         for tool in tools
     ]
@@ -358,22 +350,22 @@ async def fetch_tools(
     oauth_keys_file: Path,
     credentials_file: Path,
 ) -> list[object]:
-    server_params = StdioServerParameters(
-        command=command,
-        args=args,
-        env={
-            **os.environ,
-            "GMAIL_OAUTH_PATH": str(oauth_keys_file),
-            "GMAIL_CREDENTIALS_PATH": str(credentials_file),
-        },
-        cwd=server_working_directory(),
-    )
-
-    async with stdio_client(server_params) as (read_stream, write_stream):
-        async with ClientSession(read_stream, write_stream) as session:
-            await session.initialize()
-            result = await session.list_tools()
-            return list(result.tools)
+    async with MultiServerMCPClient(
+        {
+            "gmail": {
+                "command": command,
+                "args": args,
+                "transport": "stdio",
+                "env": {
+                    **os.environ,
+                    "GMAIL_OAUTH_PATH": str(oauth_keys_file),
+                    "GMAIL_CREDENTIALS_PATH": str(credentials_file),
+                },
+                "cwd": str(server_working_directory()),
+            }
+        }
+    ) as client:
+        return list(await client.get_tools())
 
 
 async def main() -> None:
@@ -408,8 +400,8 @@ async def main() -> None:
     parser.add_argument(
         "--top-tools",
         type=int,
-        default=int(os.getenv("TOP_TOOLS", "6")),
-        help="How many top-ranked tools to include in the generated prompt context.",
+        default=int(os.getenv("TOP_TOOLS", "0")),
+        help="How many top-ranked tools to include in the generated prompt context. Use 0 or omit the env var to include all tools.",
     )
     parser.add_argument(
         "--debug",
@@ -506,7 +498,7 @@ async def main() -> None:
                     {
                         "name": getattr(tool, "name", "") or "",
                         "description": getattr(tool, "description", "") or "",
-                        "inputSchema": getattr(tool, "inputSchema", {}) or {},
+                        "inputSchema": get_tool_schema(tool),
                     }
                     for tool in tools
                 ],
@@ -533,7 +525,7 @@ async def main() -> None:
                 for item in ranked
             ],
         )
-    top_tools = max(1, args.top_tools)
+    top_tools = None if args.top_tools <= 0 else args.top_tools
     tool_by_name = {
         getattr(tool, "name", "") or "": tool
         for tool in tools
@@ -541,13 +533,15 @@ async def main() -> None:
     }
     prompt_tools = [
         tool_by_name[ranked_tool.name]
-        for ranked_tool in ranked[:top_tools]
+        for ranked_tool in (ranked if top_tools is None else ranked[:top_tools])
         if ranked_tool.name in tool_by_name
     ]
 
     prompt = build_prompt(request_text, prompt_tools)
     if debug_logger.enabled:
         debug_logger.log("planner_prompt", prompt)
+
+    ranked_display = ranked if top_tools is None else ranked[:top_tools]
 
     print("Discovered MCP tools:")
     for tool in tools:
@@ -557,11 +551,14 @@ async def main() -> None:
 
     print()
     print(f"Tool ranking for request: {request_text}")
-    for ranked_tool in ranked[:5]:
+    for ranked_tool in ranked_display:
         print(f"- {ranked_tool.name} [score {ranked_tool.score}] {ranked_tool.reason}")
 
     print()
-    print(f"Prompt tool context size: {len(prompt_tools)} tool(s) (top-tools={top_tools})")
+    if top_tools is None:
+        print(f"Prompt tool context size: {len(prompt_tools)} tool(s) (all tools)")
+    else:
+        print(f"Prompt tool context size: {len(prompt_tools)} tool(s) (top-tools={top_tools})")
 
     print()
     print("Ollama prompt:")

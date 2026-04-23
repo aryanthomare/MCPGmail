@@ -1,109 +1,120 @@
-# Gmail MCP tool planner
+# Gmail MCP LangChain Agent
 
-This project connects to `@gongrzhe/server-gmail-autoauth-mcp`, lists the available MCP tools, and ranks which tools are most relevant for a user request.
+This project connects to `@gongrzhe/server-gmail-autoauth-mcp`, loads the available Gmail MCP tools via LangChain MCP adapters, and runs a LangGraph ReAct agent backed by a local Ollama model to answer Gmail-related requests.
 
-The Python entrypoint asks a local model to rank the discovered tools, then prints the selected tool context and generated prompt in the terminal.
+Both Python and TypeScript entry points are provided.
 
 ## Install
+
+### Python
+
+```bash
+pip install -r requirements.txt
+```
+
+### Node.js
 
 ```bash
 npm install
 ```
 
-## Run
+## Usage
+
+### Python — Gmail agent (LangChain + LangGraph + Ollama)
 
 ```bash
-npm run analyze -- "find unread emails from GitHub with attachments"
+python ollama_openai_chat.py --mcp-request "find unread emails from GitHub with attachments"
 ```
 
-Python version:
+Limit the agent to the top N tools:
 
 ```bash
-python list_gmail_tools.py "find unread emails from GitHub with attachments"
+python ollama_openai_chat.py --mcp-request "find unread emails from GitHub with attachments" --top-tools 3
 ```
 
-Reduce prompt context to top-ranked tools:
+Provide ranking instructions from a Markdown file:
 
 ```bash
-python list_gmail_tools.py --top-tools 4 "find unread emails from GitHub with attachments"
+python ollama_openai_chat.py --mcp-request "find unread emails from GitHub with attachments" --top-tools 3 --tool-ranking-prompt-file tool_ranking_prompt.md
 ```
 
-Ollama via OpenAI API format:
+Enable a bounded outer agent loop (stops early when completion checker says task is done):
+
+```bash
+python ollama_openai_chat.py --mcp-request "find unread emails from GitHub with attachments" --max-agent-loops 3
+```
+
+The Markdown prompt supports placeholders:
+
+- `{{request}}`
+- `{{tool_catalog_json}}`
+
+Direct prompt (no MCP tools):
 
 ```bash
 python ollama_openai_chat.py --prompt "Summarize unread emails from GitHub"
 ```
 
-## Local LLM mode
+Show intermediate agent messages:
 
-Set these environment variables to let the planner ask a local model for a tool plan:
+```bash
+python ollama_openai_chat.py --mcp-request "draft an email to my manager" --show-llm-io
+```
 
-- `LOCAL_LLM_BASE_URL` - defaults to `http://localhost:11434/v1`
-- `LOCAL_LLM_MODEL` - defaults to `llama3.1`
-- `LOCAL_LLM_API_KEY` - optional, only needed if your local endpoint requires one
+Enable debug log:
 
-Python script environment overrides:
+```bash
+python ollama_openai_chat.py --mcp-request "draft an email to my manager" --debug
+```
 
-- `MCP_COMMAND` - defaults to `npx`
-- `MCP_ARGS` - defaults to `-y @gongrzhe/server-gmail-autoauth-mcp`
+### Python — List and rank tools
+
+```bash
+python list_gmail_tools.py "find unread emails from GitHub with attachments"
+```
+
+Limit prompt context to top-ranked tools:
+
+```bash
+python list_gmail_tools.py --top-tools 4 "find unread emails from GitHub with attachments"
+```
+
+If you omit `--top-tools`, all ranked tools are included in the prompt context.
+
+### Node.js / TypeScript — Gmail agent
+
+```bash
+npm run analyze -- "find unread emails from GitHub with attachments"
+```
+
+## Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `OLLAMA_MODEL` | `llama3.1` | Ollama model name |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama base URL |
+| `MCP_COMMAND` | `npx` | Command to start the MCP server |
+| `MCP_ARGS` | `-y @gongrzhe/server-gmail-autoauth-mcp` | Arguments for the MCP server command |
 
 Example:
 
 ```bash
-$env:LOCAL_LLM_BASE_URL = "http://localhost:11434/v1"
-$env:LOCAL_LLM_MODEL = "llama3.1"
-npm run analyze -- "draft an email to my manager"
+export OLLAMA_MODEL=gemma4
+export OLLAMA_BASE_URL=http://localhost:11434
+python ollama_openai_chat.py --mcp-request "draft an email to my manager"
 ```
 
-To print a prompt you can paste into Ollama directly:
+## Architecture
 
-```bash
-npm run analyze -- --prompt-only "draft an email to my manager"
-```
-
-That prints the generated prompt after the local model has already ranked the tools. The prompt still contains the discovered tool catalog and the request.
+- **LangChain MCP adapters** (`langchain-mcp-adapters` / `@langchain/mcp-adapters`) connect to the Gmail MCP server and expose its tools as LangChain `BaseTool` instances.
+- **ChatOllama** (`langchain-ollama` / `@langchain/ollama`) provides the local Ollama model as a LangChain chat model.
+- **LangGraph ReAct agent** (`langgraph` / `@langchain/langgraph`) runs the tool-use loop: the model decides which tools to call, the tools are executed, and results are fed back until the request is fulfilled.
 
 ## Notes
 
 - The Gmail MCP server requires Google OAuth credentials to be set up before tool calls will succeed.
-- The code only plans tool usage by default. It does not execute Gmail actions unless you extend it to call `client.callTool(...)` for selected tools.
+- Run `npx @gongrzhe/server-gmail-autoauth-mcp auth` once to complete the browser OAuth flow and store credentials.
+- Use `python list_gmail_tools.py --auth` to run authentication via the Python script.
 
-## Ollama OpenAI script
-
-The script `ollama_openai_chat.py` uses the OpenAI Python SDK against a local Ollama server.
-
-Defaults:
-
-- `--base-url` -> `http://localhost:11434/v1`
-- `--model` -> `llama3.1`
-- `--api-key` -> `ollama` (placeholder for local usage)
-
-You can also set environment variables:
-
-- `OLLAMA_OPENAI_BASE_URL`
-- `OLLAMA_OPENAI_MODEL`
-- `OLLAMA_OPENAI_API_KEY`
-
-Example:
-
-```bash
-python ollama_openai_chat.py --model llama3.1 --prompt "Plan Gmail MCP tools for: draft an email to my manager"
-```
-
-One command that generates the prompt from MCP tools and sends it to Ollama:
-
-```bash
-python ollama_openai_chat.py --mcp-request "draft an email to my manager"
-```
-
-Use fewer tools in planner context:
-
-```bash
-python ollama_openai_chat.py --mcp-request "draft an email to my manager" --top-tools 4
-```
-
-If you also want to inspect the generated prompt:
-
-```bash
-python ollama_openai_chat.py --mcp-request "draft an email to my manager" --show-generated-prompt
-```
+Example: 
+python ollama_openai_chat.py --mcp-request "read all emails from 4/22/2026" --debug --show-llm-io --top-tools 4 --tool-ranking-prompt-file tool_ranking_prompt.md --model gemma4

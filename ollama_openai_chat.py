@@ -6,13 +6,15 @@ import html
 import json
 import os
 import re
-import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from mcp import ClientSession, StdioServerParameters, stdio_client
-from openai import OpenAI
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain.agents import create_agent
+from langchain_ollama import ChatOllama
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 
 @dataclass
@@ -34,51 +36,34 @@ class DebugLogger:
             handle.write("\n")
 
 
-def log_section(debug_logger: DebugLogger | None, title: str, phase: str, payload: object | None = None) -> None:
-    if debug_logger is None:
-        return
-
-    debug_logger.log(
-        f"section_{phase}",
-        {
-            "title": title,
-            "payload": payload,
-        },
-    )
-
-
 def parse_args() -> argparse.Namespace:
+    # Keep the CLI focused on one of two execution modes: direct chat or MCP-backed chat.
     parser = argparse.ArgumentParser(
-        description="Call a local Ollama model through the OpenAI-compatible API and print the response."
+        description="Call a local Ollama model via LangChain and optionally run Gmail MCP tools."
     )
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument(
         "--prompt",
-        help="User prompt to send to the model.",
+        help="User prompt to send to the model directly (no MCP tools).",
     )
     input_group.add_argument(
         "--mcp-request",
-        help="Request text used to generate an MCP planning prompt via list_gmail_tools.py, then send it to Ollama.",
+        help="Request text sent to a LangGraph ReAct agent backed by Gmail MCP tools.",
     )
     parser.add_argument(
         "--system",
         default="You are a helpful assistant.",
-        help="Optional system instruction.",
+        help="Optional system instruction (only used with --prompt).",
     )
     parser.add_argument(
         "--model",
-        default=os.getenv("OLLAMA_OPENAI_MODEL", "gemma4"),
+        default=os.getenv("OLLAMA_MODEL", os.getenv("OLLAMA_OPENAI_MODEL", "gemma4")),
         help="Model name served by Ollama.",
     )
     parser.add_argument(
         "--base-url",
-        default=os.getenv("OLLAMA_OPENAI_BASE_URL", "http://localhost:11434/v1"),
-        help="OpenAI-compatible base URL for Ollama.",
-    )
-    parser.add_argument(
-        "--api-key",
-        default=os.getenv("OLLAMA_OPENAI_API_KEY", "ollama"),
-        help="API key value required by the OpenAI client (placeholder is fine for local Ollama).",
+        default=os.getenv("OLLAMA_BASE_URL", os.getenv("OLLAMA_OPENAI_BASE_URL", "http://localhost:11434")),
+        help="Ollama base URL.",
     )
     parser.add_argument(
         "--temperature",
@@ -87,31 +72,26 @@ def parse_args() -> argparse.Namespace:
         help="Sampling temperature.",
     )
     parser.add_argument(
-        "--max-tokens",
+        "--top-tools",
         type=int,
         default=800,
         help="Maximum tokens in the response.",
     )
     parser.add_argument(
-        "--show-generated-prompt",
-        action="store_true",
-        help="Print the generated MCP prompt before sending it to Ollama (only used with --mcp-request).",
+        "--tool-ranking-prompt-file",
+        default=os.getenv("TOOL_RANKING_PROMPT_FILE", "tool_ranking_prompt.md"),
+        help="Markdown file containing ranking instructions. Supports {{request}} and {{tool_catalog_json}} placeholders.",
+    )
+    parser.add_argument(
+        "--max-agent-loops",
+        type=int,
+        default=int(os.getenv("MAX_AGENT_LOOPS", "3")),
+        help="Maximum number of outer agent loops; each loop runs the agent then asks an LLM completion checker if the task is done.",
     )
     parser.add_argument(
         "--show-llm-io",
         action="store_true",
-        help="Print request payloads and raw model responses for debugging.",
-    )
-    parser.add_argument(
-        "--plan-only",
-        action="store_true",
-        help="For --mcp-request, print the model plan only and skip MCP tool execution.",
-    )
-    parser.add_argument(
-        "--top-tools",
-        type=int,
-        default=int(os.getenv("TOP_TOOLS", "6")),
-        help="How many top-ranked tools to include in generated MCP prompt context.",
+        help="Print intermediate agent messages for debugging.",
     )
     parser.add_argument(
         "--debug",
@@ -126,73 +106,48 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def extract_generated_prompt(stdout: str) -> str:
-    marker = "Ollama prompt:\n"
-    index = stdout.find(marker)
-    if index == -1:
-        raise ValueError("Could not find 'Ollama prompt:' in list_gmail_tools.py output.")
-
-    prompt = stdout[index + len(marker) :].strip()
-    if not prompt:
-        raise ValueError("Generated MCP prompt was empty.")
-
-    return prompt
 
 
-def build_prompt_from_mcp_request(
-    request_text: str,
-    top_tools: int,
-    debug_logger: DebugLogger | None = None,
-) -> str:
-    script_path = Path(__file__).with_name("list_gmail_tools.py")
-    command = [
-        sys.executable,
-        str(script_path),
-        "--prompt-only",
-        "--top-tools",
-        str(max(1, top_tools)),
-        request_text,
+def find_oauth_keys_file() -> Path | None:
+    # Support both a local project file and the standard ~/.gmail-mcp location.
+    candidates = [
+        Path.cwd() / "gcp-oauth.keys.json",
+        Path.home() / ".gmail-mcp" / "gcp-oauth.keys.json",
     ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
-    env = None
-    if debug_logger and debug_logger.enabled and debug_logger.log_file is not None:
-        command.insert(2, "--debug")
-        command.extend(["--debug-log-file", str(debug_logger.log_file)])
-        env = {
-            **os.environ,
-            "MCP_DEBUG_LOG_FILE": str(debug_logger.log_file),
-        }
 
-    if debug_logger:
-        debug_logger.log(
-            "subprocess_start",
-            {
-                "title": "generate_mcp_prompt",
-                "command": command,
-            },
-        )
+def find_credentials_file() -> Path | None:
+    # Credentials are stored alongside the OAuth keys or in the user's Gmail MCP folder.
+    candidates = [
+        Path.cwd() / "credentials.json",
+        Path.home() / ".gmail-mcp" / "credentials.json",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
-    completed = subprocess.run(command, capture_output=True, text=True, check=False, env=env)
-    if debug_logger:
-        debug_logger.log(
-            "subprocess_stdout",
-            {
-                "title": "generate_mcp_prompt",
-                "stdout": completed.stdout,
-            },
-        )
-        debug_logger.log(
-            "subprocess_stderr",
-            {
-                "title": "generate_mcp_prompt",
-                "stderr": completed.stderr,
-            },
-        )
-    if completed.returncode != 0:
-        stderr = completed.stderr.strip() or "No stderr captured."
-        raise RuntimeError(f"Prompt generation failed: {stderr}")
 
-    return extract_generated_prompt(completed.stdout)
+def server_working_directory() -> Path:
+    # Use a stable temp folder so the MCP server has a writable working directory.
+    temp_dir = Path(os.getenv("TEMP", str(Path.home()))) / "gmail-mcp-client"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    return temp_dir
+
+
+def get_tool_schema(tool: object) -> dict[str, object]:
+    args_schema = getattr(tool, "args_schema", None)
+    if args_schema is None:
+        return {}
+    if hasattr(args_schema, "model_json_schema"):
+        return args_schema.model_json_schema()  # type: ignore[return-value]
+    if hasattr(args_schema, "schema"):
+        return args_schema.schema()  # type: ignore[return-value]
+    return {}
 
 
 def extract_json_object(text: str) -> dict[str, object] | None:
@@ -255,7 +210,6 @@ def try_parse_json_object(text: str) -> dict[str, object] | None:
 
     if isinstance(payload, dict):
         return payload
-
     return None
 
 
@@ -310,17 +264,68 @@ def build_step_prompt(request_text: str, tool_prompt: str, tool_outputs: str | N
         "Tool catalog prompt:",
         tool_prompt,
     ]
-    if tool_outputs:
-        sections.extend(
+    catalog_json = json.dumps(catalog, indent=2)
+
+    prompt = template.replace("{{request}}", request).replace("{{tool_catalog_json}}", catalog_json)
+    if "{{request}}" not in template:
+        prompt = f"{prompt}\n\nUser request:\n{request}"
+    if "{{tool_catalog_json}}" not in template:
+        prompt = f"{prompt}\n\nTool catalog:\n{catalog_json}"
+
+    return "\n\n".join(
+        [
+            prompt,
+            "Return JSON only. No markdown.",
+            'Use this exact shape: {"rankedTools":[{"name":"tool_name","reason":"why"}]}',
+            "Only include tool names from the provided catalog.",
+        ]
+    )
+
+
+def rank_tools_with_prompt(
+    tools: list[object],
+    request: str,
+    model: str,
+    base_url: str,
+    prompt_file: Path,
+    debug_logger: DebugLogger | None = None,
+) -> list[object] | None:
+    if not prompt_file.exists():
+        return None
+
+    template = prompt_file.read_text(encoding="utf-8")
+    prompt = build_ranking_prompt(template, request, tools)
+    llm = ChatOllama(model=model, base_url=base_url, temperature=0.0).with_structured_output(
+        TOOL_RANKING_SCHEMA,
+        method="json_schema",
+    )
+    tool_by_name = {
+        getattr(tool, "name", "") or "": tool
+        for tool in tools
+        if getattr(tool, "name", "")
+    }
+
+    if debug_logger:
+        debug_logger.log("tool_ranking_prompt_file", str(prompt_file))
+        debug_logger.log("tool_ranking_prompt", prompt)
+
+    try:
+        response = llm.invoke(
             [
-                "",
-                "Tool outputs so far:",
-                tool_outputs,
+                SystemMessage(content="You are a strict tool-ranking assistant."),
+                HumanMessage(content=prompt),
             ]
         )
+    except Exception as error:  # noqa: BLE001
+        if debug_logger:
+            debug_logger.log("tool_ranking_error", str(error))
+        return None
 
-    return "\n".join(sections)
+    if not isinstance(response, dict):
+        return None
 
+    if debug_logger:
+        debug_logger.log("tool_ranking_response", response)
 
 def truncate_for_prompt(text: str, max_chars: int = 6000) -> str:
     if len(text) <= max_chars:
@@ -341,22 +346,79 @@ def find_oauth_keys_file() -> Path | None:
             return candidate
     return None
 
+    ranked_tools: list[object] = []
+    seen_names: set[str] = set()
+    for entry in ranked_entries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name or name in seen_names:
+            continue
+        tool = tool_by_name.get(name)
+        if tool is None:
+            continue
+        seen_names.add(name)
+        ranked_tools.append(tool)
 
-def find_credentials_file() -> Path | None:
-    candidates = [
-        Path.cwd() / "credentials.json",
-        Path.home() / ".gmail-mcp" / "credentials.json",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return None
+    return ranked_tools or None
 
 
-def server_working_directory() -> Path:
-    temp_dir = Path(os.getenv("TEMP", str(Path.home()))) / "gmail-mcp-client"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    return temp_dir
+def select_top_tools(
+    all_tools: list[object],
+    ranked_tools: list[object],
+    request_text: str,
+    top_tools: int,
+) -> list[object]:
+    if top_tools <= 0:
+        return list(all_tools)
+
+    tool_by_name = {
+        getattr(tool, "name", "") or "": tool
+        for tool in all_tools
+        if getattr(tool, "name", "")
+    }
+    request_lower = request_text.lower()
+    wants_read_email = (
+        any(word in request_lower for word in {"read", "view", "summar", "show", "list"})
+        and any(word in request_lower for word in {"email", "mail", "inbox"})
+    )
+
+    prioritized: list[object] = []
+    if wants_read_email:
+        for required_name in ["search_emails", "read_email"]:
+            tool = tool_by_name.get(required_name)
+            if tool is not None:
+                prioritized.append(tool)
+
+    for tool in ranked_tools:
+        name = getattr(tool, "name", "") or ""
+        if not name:
+            continue
+        if any((getattr(t, "name", "") or "") == name for t in prioritized):
+            continue
+        prioritized.append(tool)
+
+    return prioritized[:top_tools]
+
+
+def message_content_to_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    try:
+        return json.dumps(content, default=str)
+    except TypeError:
+        return str(content)
+
+
+def format_messages_for_completion_check(messages: list[object], max_messages: int = 12) -> str:
+    lines: list[str] = []
+    for message in messages[-max_messages:]:
+        message_type = str(getattr(message, "type", "unknown"))
+        content = message_content_to_text(getattr(message, "content", ""))
+        lines.append(f"[{message_type}] {content}")
+    return "\n".join(lines)
 
 
 def tool_result_to_text(result: object) -> str:
@@ -443,13 +505,20 @@ def build_final_answer_prompt(user_request: str, tool_outputs: str) -> str:
         "Do not repeat the full email bodies or add filler text."
     )
 
+    try:
+        response = checker.invoke(
+            [
+                SystemMessage(content="You are a strict completion checker. Output valid JSON only."),
+                HumanMessage(content=prompt),
+            ]
+        )
+    except Exception as error:  # noqa: BLE001
+        if debug_logger:
+            debug_logger.log("completion_check_error", str(error))
+        return False, f"Completion check failed: {error}"
 
-def extract_message_id(text: str) -> str | None:
-    match = re.search(r"\bID:\s*([A-Za-z0-9_-]+)", text)
-    if match:
-        return match.group(1)
-    return None
-
+    if not isinstance(response, dict):
+        return False, "Completion checker returned an unexpected response type."
 
 def extract_message_ids(text: str) -> list[str]:
     return re.findall(r"\bID:\s*([A-Za-z0-9_-]+)", text)
@@ -479,32 +548,78 @@ def resolve_dynamic_arguments(arguments: dict[str, object], last_message_id: str
             resolved[key] = last_message_id or ""
     return resolved
 
+    if isinstance(completed_value, bool):
+        return completed_value, reason
+    if isinstance(completed_value, str):
+        return completed_value.strip().lower() in {"true", "yes", "1"}, reason
 
-def is_valid_message_id(value: object) -> bool:
-    if not isinstance(value, str):
-        return False
-    candidate = value.strip()
-    if not candidate:
-        return False
-    if "@" in candidate:
-        return False
-    return True
+    return False, reason
 
 
-async def execute_mcp_tools_from_plan(
-    plan: dict[str, object],
+async def run_direct_chat(
+    user_prompt: str,
+    system_prompt: str,
+    model: str,
+    base_url: str,
+    temperature: float,
+    show_llm_io: bool = False,
     debug_logger: DebugLogger | None = None,
-) -> str:
-    chosen_tools = plan.get("chosenTools")
-    if not isinstance(chosen_tools, list) or not chosen_tools:
-        return "No tools selected by the model plan."
+) -> None:
+    # Direct mode bypasses MCP and sends the prompt straight to Ollama.
+    llm = ChatOllama(model=model, base_url=base_url, temperature=temperature)
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt),
+    ]
+    if debug_logger:
+        debug_logger.log("direct_chat_request", {"prompt": user_prompt, "system": system_prompt})
+    if show_llm_io:
+        print("Request messages:\n")
+        for msg in messages:
+            print(f"[{msg.type}] {msg.content}")
+        print("\n--- End request messages ---\n")
+    response = llm.invoke(messages)
+    content = response.content
+    if isinstance(content, list):
+        content = " ".join(str(part) for part in content)
+    if debug_logger:
+        debug_logger.log("direct_chat_response", content)
+    if show_llm_io:
+        print("Raw response:\n")
+        print(content or "<empty>")
+        print("\n--- End raw response ---\n")
+    print(content)
 
+
+async def run_mcp_agent(
+    request_text: str,
+    model: str,
+    base_url: str,
+    temperature: float,
+    top_tools: int,
+    tool_ranking_prompt_file: str,
+    max_agent_loops: int,
+    show_llm_io: bool = False,
+    debug_logger: DebugLogger | None = None,
+) -> None:
+    # MCP mode first verifies credentials, then loads Gmail tools into the agent.
     oauth_keys_file = find_oauth_keys_file()
-    credentials_file = find_credentials_file()
-    if oauth_keys_file is None or credentials_file is None:
-        raise RuntimeError(
-            "Missing OAuth files. Ensure gcp-oauth.keys.json and credentials.json are configured."
+    if oauth_keys_file is None:
+        print(
+            "Gmail MCP server cannot start because gcp-oauth.keys.json was not found.",
+            file=sys.stderr,
         )
+        print(
+            "Place the file in the current directory or in ~/.gmail-mcp/, then rerun the script.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    credentials_file = find_credentials_file()
+    if credentials_file is None:
+        print("Gmail MCP credentials.json was not found. Run authentication first with:", file=sys.stderr)
+        print("  npx @gongrzhe/server-gmail-autoauth-mcp auth", file=sys.stderr)
+        sys.exit(1)
 
     mcp_command = os.getenv("MCP_COMMAND", "npx")
     mcp_args = [
@@ -513,16 +628,7 @@ async def execute_mcp_tools_from_plan(
         if part
     ]
 
-    server_params = StdioServerParameters(
-        command=mcp_command,
-        args=mcp_args,
-        env={
-            **os.environ,
-            "GMAIL_OAUTH_PATH": str(oauth_keys_file),
-            "GMAIL_CREDENTIALS_PATH": str(credentials_file),
-        },
-        cwd=server_working_directory(),
-    )
+    llm = ChatOllama(model=model, base_url=base_url, temperature=temperature)
 
     outputs: list[str] = []
     async with stdio_client(server_params) as (read_stream, write_stream):
@@ -628,8 +734,28 @@ def request_planned_step(
         max_tokens=max_tokens,
         response_format={"type": "json_object"},
     )
-    return response.choices[0].message.content if response.choices else None
+    tools = await mcp_client.get_tools()
+    all_tools = list(tools)
+    selected_tools = list(tools)
 
+    if top_tools > 0:
+        prompt_ranked = rank_tools_with_prompt(
+            tools=tools,
+            request=request_text,
+            model=model,
+            base_url=base_url,
+            prompt_file=Path(tool_ranking_prompt_file).expanduser(),
+            debug_logger=debug_logger,
+        )
+        ranked_tools = prompt_ranked if prompt_ranked is not None else rank_tools(tools, request_text)
+        selected_tools = select_top_tools(
+            all_tools=all_tools,
+            ranked_tools=ranked_tools,
+            request_text=request_text,
+            top_tools=top_tools,
+        )
+
+    tools = selected_tools
 
 def request_planned_step_with_retry(
     client: OpenAI,
@@ -692,15 +818,79 @@ def extract_planning_plan(plan_content: str | None) -> dict[str, object] | None:
     if not plan_content:
         return None
 
-    plan_json = extract_json_object(plan_content)
-    if not plan_json:
-        return None
+    if debug_logger:
+        debug_logger.log("agent_request", {"request": request_text})
 
-    chosen_tools = plan_json.get("chosenTools")
-    if not isinstance(chosen_tools, list):
-        return None
+    for loop_index in range(1, max_loops + 1):
+        response = await agent.ainvoke({"messages": conversation_messages})
+        response_messages = response.get("messages", [])
+        if isinstance(response_messages, list) and response_messages:
+            conversation_messages = response_messages
 
-    return plan_json
+        latest_ai_message = None
+        if isinstance(response_messages, list):
+            for message in reversed(response_messages):
+                if isinstance(message, AIMessage):
+                    latest_ai_message = message
+                    break
+        made_tool_calls = bool(getattr(latest_ai_message, "tool_calls", None))
+
+        completed, completion_reason = should_end_agent_loop(
+            request_text=request_text,
+            messages=conversation_messages,
+            model=model,
+            base_url=base_url,
+            debug_logger=debug_logger,
+        )
+        if debug_logger:
+            debug_logger.log(
+                "agent_loop_check",
+                {
+                    "loop": loop_index,
+                    "completed": completed,
+                    "reason": completion_reason,
+                },
+            )
+
+        if completed:
+            break
+
+        if not made_tool_calls:
+            if debug_logger:
+                debug_logger.log(
+                    "agent_loop_stopped",
+                    {
+                        "loop": loop_index,
+                        "reason": "No tool calls were produced, so the agent cannot make further progress without new user input.",
+                    },
+                )
+            break
+
+    for message in conversation_messages:
+        if debug_logger:
+            debug_logger.log(
+                "agent_message",
+                {"type": message.type, "content": message.content},
+            )
+            if isinstance(message, AIMessage) and getattr(message, "tool_calls", None):
+                debug_logger.log(
+                    "agent_tool_call",
+                    {
+                        "tool_calls": getattr(message, "tool_calls", []),
+                    },
+                )
+            if getattr(message, "type", "") == "tool":
+                debug_logger.log(
+                    "tool_return",
+                    {
+                        "name": getattr(message, "name", ""),
+                        "content": message.content,
+                    },
+                )
+        if show_llm_io:
+            print(f"[{message.type}] {message.content}\n")
+        elif isinstance(message, AIMessage) and message.content and not getattr(message, "tool_calls", None):
+            print(message.content)
 
 
 def extract_chosen_tools(plan_content: str | None) -> dict[str, object] | None:
@@ -718,14 +908,13 @@ def main() -> None:
         log_file=Path(args.debug_log_file).expanduser() if args.debug else None,
     )
     if debug_logger.enabled and debug_logger.log_file is not None:
+        # Record the top-level invocation details before any tool or model work begins.
         debug_logger.log(
             "script_start",
             {
                 "request": args.prompt or args.mcp_request or "",
                 "model": args.model,
                 "temperature": args.temperature,
-                "max_tokens": args.max_tokens,
-                "top_tools": args.top_tools,
                 "mcp_request": bool(args.mcp_request),
             },
         )
@@ -827,8 +1016,7 @@ def main() -> None:
             plan_content = request_planned_step_with_retry(
                 client=client,
                 model=args.model,
-                system_prompt=planning_system,
-                user_prompt=current_prompt,
+                base_url=args.base_url,
                 temperature=args.temperature,
                 max_tokens=args.max_tokens,
                 debug_logger=debug_logger,
@@ -907,77 +1095,23 @@ def main() -> None:
             user_prompt,
             "\n\n".join(tool_outputs),
         )
-
-    if not tool_outputs:
-        print("No tools selected by the model plan.")
-        return
-
-    final_prompt = build_final_answer_prompt(args.mcp_request, "\n\n".join(tool_outputs))
-
-    if args.show_llm_io:
-        print("Executed tool outputs:\n")
-        print(tool_outputs)
-        print("\n--- End executed tool outputs ---\n")
-
-    try:
-        log_section(debug_logger, "final_summary", "start", {"prompt": final_prompt})
-        final_payload = {
-            "model": args.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a Gmail assistant. Use tool results as source of truth.",
-                },
-                {"role": "user", "content": final_prompt},
-            ],
-            "temperature": args.temperature,
-            "max_tokens": args.max_tokens,
-        }
-        if args.show_llm_io:
-            print("Final request payload:\n")
-            print(json.dumps(final_payload, indent=2))
-            print("\n--- End final request payload ---\n")
-
-        if debug_logger.enabled:
-            debug_logger.log("final_summary_request", final_payload)
-
-        final_response = client.chat.completions.create(
-            model=final_payload["model"],
-            messages=final_payload["messages"],
-            temperature=final_payload["temperature"],
-            max_tokens=final_payload["max_tokens"],
-        )
-        if debug_logger.enabled:
-            debug_logger.log(
-                "final_summary_response_raw",
-                final_response.model_dump() if hasattr(final_response, "model_dump") else str(final_response),
+    else:
+        asyncio.run(
+            run_mcp_agent(
+                request_text=args.mcp_request,
+                model=args.model,
+                base_url=args.base_url,
+                temperature=args.temperature,
+                top_tools=args.top_tools,
+                tool_ranking_prompt_file=args.tool_ranking_prompt_file,
+                max_agent_loops=args.max_agent_loops,
+                show_llm_io=args.show_llm_io,
+                debug_logger=debug_logger,
             )
-    except Exception as error:
-        if debug_logger.enabled:
-            debug_logger.log("script_error", {"stage": "final_summary", "error": str(error)})
-        print(f"Final summarization failed: {error}", file=sys.stderr)
-        print("Tool outputs were:\n")
-        print(tool_outputs)
-        return
-    finally:
-        log_section(debug_logger, "final_summary", "end")
-
-    final_content = final_response.choices[0].message.content if final_response.choices else None
-    if args.show_llm_io:
-        print("Final raw response:\n")
-        print(final_content or "<empty>")
-        print("\n--- End final raw response ---\n")
+        )
 
     if debug_logger.enabled:
-        debug_logger.log("final_summary_response_content", final_content)
         debug_logger.log("script_end", {"status": "ok"})
-
-    if not final_content:
-        print("No final content returned by model. Tool outputs were:\n")
-        print(tool_outputs)
-        return
-
-    print(final_content)
 
 
 if __name__ == "__main__":
