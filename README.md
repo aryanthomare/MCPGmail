@@ -26,6 +26,29 @@ npm install
 python ollama_openai_chat.py --mcp-request "find unread emails from GitHub with attachments"
 ```
 
+Limit the agent to the top N tools:
+
+```bash
+python ollama_openai_chat.py --mcp-request "find unread emails from GitHub with attachments" --top-tools 3
+```
+
+Provide ranking instructions from a Markdown file:
+
+```bash
+python ollama_openai_chat.py --mcp-request "find unread emails from GitHub with attachments" --top-tools 3 --tool-ranking-prompt-file tool_ranking_prompt.md
+```
+
+Enable a bounded outer agent loop (stops early when completion checker says task is done):
+
+```bash
+python ollama_openai_chat.py --mcp-request "find unread emails from GitHub with attachments" --max-agent-loops 3
+```
+
+The Markdown prompt supports placeholders:
+
+- `{{request}}`
+- `{{tool_catalog_json}}`
+
 Direct prompt (no MCP tools):
 
 ```bash
@@ -55,6 +78,8 @@ Limit prompt context to top-ranked tools:
 ```bash
 python list_gmail_tools.py --top-tools 4 "find unread emails from GitHub with attachments"
 ```
+
+If you omit `--top-tools`, all ranked tools are included in the prompt context.
 
 ### Node.js / TypeScript — Gmail agent
 

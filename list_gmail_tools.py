@@ -398,8 +398,8 @@ async def main() -> None:
     parser.add_argument(
         "--top-tools",
         type=int,
-        default=int(os.getenv("TOP_TOOLS", "6")),
-        help="How many top-ranked tools to include in the generated prompt context.",
+        default=int(os.getenv("TOP_TOOLS", "0")),
+        help="How many top-ranked tools to include in the generated prompt context. Use 0 or omit the env var to include all tools.",
     )
     parser.add_argument(
         "--debug",
@@ -523,7 +523,7 @@ async def main() -> None:
                 for item in ranked
             ],
         )
-    top_tools = max(1, args.top_tools)
+    top_tools = None if args.top_tools <= 0 else args.top_tools
     tool_by_name = {
         getattr(tool, "name", "") or "": tool
         for tool in tools
@@ -531,13 +531,15 @@ async def main() -> None:
     }
     prompt_tools = [
         tool_by_name[ranked_tool.name]
-        for ranked_tool in ranked[:top_tools]
+        for ranked_tool in (ranked if top_tools is None else ranked[:top_tools])
         if ranked_tool.name in tool_by_name
     ]
 
     prompt = build_prompt(request_text, prompt_tools)
     if debug_logger.enabled:
         debug_logger.log("planner_prompt", prompt)
+
+    ranked_display = ranked if top_tools is None else ranked[:top_tools]
 
     print("Discovered MCP tools:")
     for tool in tools:
@@ -547,11 +549,14 @@ async def main() -> None:
 
     print()
     print(f"Tool ranking for request: {request_text}")
-    for ranked_tool in ranked[:5]:
+    for ranked_tool in ranked_display:
         print(f"- {ranked_tool.name} [score {ranked_tool.score}] {ranked_tool.reason}")
 
     print()
-    print(f"Prompt tool context size: {len(prompt_tools)} tool(s) (top-tools={top_tools})")
+    if top_tools is None:
+        print(f"Prompt tool context size: {len(prompt_tools)} tool(s) (all tools)")
+    else:
+        print(f"Prompt tool context size: {len(prompt_tools)} tool(s) (top-tools={top_tools})")
 
     print()
     print("Ollama prompt:")
