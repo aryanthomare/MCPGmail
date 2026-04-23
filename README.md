@@ -116,3 +116,5 @@ python ollama_openai_chat.py --mcp-request "draft an email to my manager"
 - Run `npx @gongrzhe/server-gmail-autoauth-mcp auth` once to complete the browser OAuth flow and store credentials.
 - Use `python list_gmail_tools.py --auth` to run authentication via the Python script.
 
+Example: 
+python ollama_openai_chat.py --mcp-request "read all emails from 4/22/2026" --debug --show-llm-io --top-tools 4 --tool-ranking-prompt-file tool_ranking_prompt.md --model gemma4
