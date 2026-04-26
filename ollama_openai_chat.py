@@ -14,6 +14,7 @@ from pathlib import Path
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain.agents import create_agent
 from langchain_ollama import ChatOllama
+from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 
@@ -36,10 +37,26 @@ class DebugLogger:
             handle.write("\n")
 
 
+def build_llm(
+    provider: str,
+    model: str,
+    base_url: str,
+    temperature: float,
+    claude_model: str = "claude-opus-4-5",
+    claude_api_key: str | None = None,
+) -> object:
+    """Return a LangChain chat model for the requested provider."""
+    if provider == "claude":
+        return ChatAnthropic(model=claude_model, api_key=claude_api_key, temperature=temperature)
+    if provider == "ollama":
+        return ChatOllama(model=model, base_url=base_url, temperature=temperature)
+    raise ValueError(f"Unknown provider: {provider!r}. Choose 'ollama' or 'claude'.")
+
+
 def parse_args() -> argparse.Namespace:
     # Keep the CLI focused on one of two execution modes: direct chat or MCP-backed chat.
     parser = argparse.ArgumentParser(
-        description="Call a local Ollama model via LangChain and optionally run Gmail MCP tools."
+        description="Call a local Ollama model or the Claude API via LangChain and optionally run Gmail MCP tools."
     )
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument(
@@ -102,6 +119,22 @@ def parse_args() -> argparse.Namespace:
         "--debug-log-file",
         default=os.getenv("MCP_DEBUG_LOG_FILE", "mcp_pipeline_debug.log"),
         help="Path to the debug log file (used with --debug).",
+    )
+    parser.add_argument(
+        "--provider",
+        choices=["ollama", "claude"],
+        default=os.getenv("LLM_PROVIDER", "ollama"),
+        help="LLM backend to use: 'ollama' (default, local) or 'claude' (Anthropic API).",
+    )
+    parser.add_argument(
+        "--claude-model",
+        default=os.getenv("CLAUDE_MODEL", "claude-opus-4-5"),
+        help="Anthropic model name (used with --provider claude).",
+    )
+    parser.add_argument(
+        "--claude-api-key",
+        default=os.getenv("ANTHROPIC_API_KEY"),
+        help="Anthropic API key (used with --provider claude). Defaults to ANTHROPIC_API_KEY env var.",
     )
     return parser.parse_args()
 
@@ -289,13 +322,23 @@ def rank_tools_with_prompt(
     base_url: str,
     prompt_file: Path,
     debug_logger: DebugLogger | None = None,
+    provider: str = "ollama",
+    claude_model: str = "claude-opus-4-5",
+    claude_api_key: str | None = None,
 ) -> list[object] | None:
     if not prompt_file.exists():
         return None
 
     template = prompt_file.read_text(encoding="utf-8")
     prompt = build_ranking_prompt(template, request, tools)
-    llm = ChatOllama(model=model, base_url=base_url, temperature=0.0).with_structured_output(
+    llm = build_llm(
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        temperature=0.0,
+        claude_model=claude_model,
+        claude_api_key=claude_api_key,
+    ).with_structured_output(
         TOOL_RANKING_SCHEMA,
         method="json_schema",
     )
@@ -564,9 +607,19 @@ async def run_direct_chat(
     temperature: float,
     show_llm_io: bool = False,
     debug_logger: DebugLogger | None = None,
+    provider: str = "ollama",
+    claude_model: str = "claude-opus-4-5",
+    claude_api_key: str | None = None,
 ) -> None:
-    # Direct mode bypasses MCP and sends the prompt straight to Ollama.
-    llm = ChatOllama(model=model, base_url=base_url, temperature=temperature)
+    # Direct mode bypasses MCP and sends the prompt straight to the configured LLM.
+    llm = build_llm(
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        temperature=temperature,
+        claude_model=claude_model,
+        claude_api_key=claude_api_key,
+    )
     messages = [
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_prompt),
@@ -601,6 +654,9 @@ async def run_mcp_agent(
     max_agent_loops: int,
     show_llm_io: bool = False,
     debug_logger: DebugLogger | None = None,
+    provider: str = "ollama",
+    claude_model: str = "claude-opus-4-5",
+    claude_api_key: str | None = None,
 ) -> None:
     # MCP mode first verifies credentials, then loads Gmail tools into the agent.
     oauth_keys_file = find_oauth_keys_file()
@@ -628,7 +684,14 @@ async def run_mcp_agent(
         if part
     ]
 
-    llm = ChatOllama(model=model, base_url=base_url, temperature=temperature)
+    llm = build_llm(
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        temperature=temperature,
+        claude_model=claude_model,
+        claude_api_key=claude_api_key,
+    )
 
     outputs: list[str] = []
     async with stdio_client(server_params) as (read_stream, write_stream):
@@ -746,6 +809,9 @@ def request_planned_step(
             base_url=base_url,
             prompt_file=Path(tool_ranking_prompt_file).expanduser(),
             debug_logger=debug_logger,
+            provider=provider,
+            claude_model=claude_model,
+            claude_api_key=claude_api_key,
         )
         ranked_tools = prompt_ranked if prompt_ranked is not None else rank_tools(tools, request_text)
         selected_tools = select_top_tools(
@@ -841,6 +907,9 @@ def extract_planning_plan(plan_content: str | None) -> dict[str, object] | None:
             model=model,
             base_url=base_url,
             debug_logger=debug_logger,
+            provider=provider,
+            claude_model=claude_model,
+            claude_api_key=claude_api_key,
         )
         if debug_logger:
             debug_logger.log(
@@ -1107,6 +1176,9 @@ def main() -> None:
                 max_agent_loops=args.max_agent_loops,
                 show_llm_io=args.show_llm_io,
                 debug_logger=debug_logger,
+                provider=args.provider,
+                claude_model=args.claude_model,
+                claude_api_key=args.claude_api_key,
             )
         )
 
